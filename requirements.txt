@@ -1,7 +1,5 @@
-Flask
-opencv-python-headless
+streamlit
 requests
+opencv-python-headless
 requests-cache
-Werkzeug
-gunicorn
 edge-tts
