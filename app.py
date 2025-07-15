@@ -1,124 +1,105 @@
-# ✅ UPDATED app.py (for Android WebView-compatible Read Aloud)
-
 import os
-import logging
-from flask import Flask, render_template, request, jsonify
-from werkzeug.middleware.proxy_fix import ProxyFix
+import tempfile
+import uuid
+import cv2
+from flask import Flask, jsonify, render_template, send_file, redirect, request
+from werkzeug.utils import secure_filename
+from OBR import SegmentationEngine, BrailleClassifier, BrailleImage
+import edge_tts
+import asyncio
 
-# Utility imports
-from utils.braille_converter import text_to_braille, braille_to_text
-from utils.hindi_braille_converter import hindi_text_to_braille, get_detailed_hindi_braille_mapping
-from utils.image_processor import extract_text_from_image
-from utils.speech_processor import text_to_speech
-from utils.braille_image_processor import detect_braille_from_image
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+tempdir = tempfile.TemporaryDirectory()
+app = Flask("Optical Braille Recognition Demo")
+app.config['UPLOAD_FOLDER'] = tempdir.name
 
-# Logging
-logging.basicConfig(level=logging.DEBUG)
+# Dynamic audio filename will be used per request
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SESSION_SECRET", "default_secret_key_for_development")
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
-# Pages
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
-@app.route('/text-to-braille')
-def text_to_braille_page():
-    return render_template('text_to_braille.html')
+@app.route('/favicon.ico')
+def fav():
+    return send_file('favicon.ico', mimetype='image/ico')
 
-@app.route('/image-to-braille')
-def image_to_braille_page():
-    return render_template('image_to_braille.html')
+@app.route('/coverimage')
+def cover_image():
+    return send_file('samples/sample1.png', mimetype='image/png')
 
-# ✅ Image to Text & Braille
-@app.route('/api/image-to-text', methods=['POST'])
-def process_image():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image provided'}), 400
+@app.route('/procimage/<string:img_id>')
+def proc_image(img_id):
+    image = '{}/{}-proc.png'.format(tempdir.name, secure_filename(img_id))
+    if os.path.exists(image) and os.path.isfile(image):
+        return send_file(image, mimetype='image/png')
+    return redirect('/coverimage')
 
-    image_file = request.files['image']
-    if image_file.filename == '':
-        return jsonify({'error': 'No image selected'}), 400
+@app.route('/digest', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return jsonify({"error": True, "message": "file not in request"})
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": True, "message": "empty filename"})
+    if file and allowed_file(file.filename):
+        filename = ''.join(str(uuid.uuid4()).split('-'))
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
 
-    language = request.form.get('language', 'english')
+        classifier = BrailleClassifier()
+        img = BrailleImage(file_path)
+        for letter in SegmentationEngine(image=img):
+            letter.mark()
+            classifier.push(letter)
+        cv2.imwrite(os.path.join(app.config['UPLOAD_FOLDER'], f"{filename}-proc.png"), img.get_final_image())
+        os.unlink(file_path)
 
-    try:
-        extracted_text = extract_text_from_image(image_file, lang='hin' if language == 'hindi' else 'eng')
-        if not extracted_text:
-            return jsonify({'error': 'No text detected in the image'}), 400
-
-        if language == 'hindi':
-            braille = hindi_text_to_braille(extracted_text)
-            detailed_mapping = get_detailed_hindi_braille_mapping(extracted_text)
-        else:
-            braille = text_to_braille(extracted_text)
-            detailed_mapping = []
-            for i, char in enumerate(extracted_text):
-                detailed_mapping.append({
-                    'original': 'space' if char == ' ' else char,
-                    'braille': '⠀' if char == ' ' else braille[i] if i < len(braille) else '⠿'
-                })
-
+        digest_result = classifier.digest()
         return jsonify({
-            'text': extracted_text,
-            'braille': braille,
-            'detailed_mapping': detailed_mapping,
-            'language': language
+            "error": False,
+            "message": "Processed and Digested successfully",
+            "img_id": filename,
+            "digest": digest_result
         })
-    except Exception as e:
-        logging.error(f"Error processing image: {str(e)}")
-        return jsonify({'error': f'Error processing image: {str(e)}'}), 500
 
-# ✅ Text to Braille API
-@app.route('/api/text-to-braille', methods=['POST'])
-def convert_text_to_braille():
-    data = request.get_json()
-    text = data.get('text', '')
-    language = data.get('language', 'english')
-
+@app.route('/speech', methods=['POST'])
+def speech():
+    text = request.form.get("text", "").strip()
     if not text:
-        return jsonify({'error': 'No text provided'}), 400
+        return jsonify({"error": True, "message": "No text provided"})
+
+    audio_filename = f"{uuid.uuid4()}.mp3"
+    audio_path = os.path.join(app.config['UPLOAD_FOLDER'], audio_filename)
+
+    async def generate_tts():
+        communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
+        await communicate.save(audio_path)
 
     try:
-        if language == 'hindi':
-            braille = hindi_text_to_braille(text)
-            detailed_mapping = get_detailed_hindi_braille_mapping(text)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            task = loop.create_task(generate_tts())
+            loop.run_until_complete(task)
         else:
-            braille = text_to_braille(text)
-            detailed_mapping = []
-            for i, char in enumerate(text):
-                detailed_mapping.append({
-                    'original': 'space' if char == ' ' else char,
-                    'braille': '⠀' if char == ' ' else braille[i] if i < len(braille) else '⠿'
-                })
+            loop.run_until_complete(generate_tts())
 
-        return jsonify({
-            'braille': braille,
-            'detailed_mapping': detailed_mapping
-        })
+        return jsonify({"error": False, "url": f"/getaudio/{audio_filename}"})
     except Exception as e:
-        logging.error(f"Error converting text to braille: {str(e)}")
-        return jsonify({'error': f'Error converting text to braille: {str(e)}'}), 500
+        return jsonify({"error": True, "message": f"TTS failed: {str(e)}"})
 
-# ✅ FIXED: Text to Speech that works in Android WebView
-@app.route('/api/text-to-speech', methods=['POST'])
-def convert_text_to_speech():
-    data = request.get_json()
-    text = data.get('text', '')
-    language = data.get('language', 'english')
+@app.route('/getaudio/<string:filename>')
+def get_audio(filename):
+    audio_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if os.path.exists(audio_path):
+        return send_file(audio_path, mimetype="audio/mpeg")
+    return jsonify({"error": True, "message": "Audio not found"})
 
-    if not text:
-        return jsonify({'error': 'No text provided'}), 400
-
-    try:
-        audio_url = text_to_speech(text, language)
-        return jsonify({'audio_url': audio_url})
-    except Exception as e:
-        logging.error(f"Error converting text to speech: {str(e)}")
-        return jsonify({'error': f'Error converting text to speech: {str(e)}'}), 500
-
-# Run the app
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(debug=True)
